@@ -85,7 +85,6 @@ client.on('ready', async () => {
 client.on('message', async (msg) => {
     try {
         const chat = await msg.getChat();
-        console.log(`[DEBUG] Message in ${JSON.stringify(chat, null, 2)}}`);
         const sender = await msg.getContact();
         const isAdmin = chat.groupMetadata?.participants.find(p => p.id._serialized === sender.id._serialized)?.isAdmin;
 
@@ -97,6 +96,8 @@ client.on('message', async (msg) => {
             return;
         }
 
+        const isVoiceMessage = msg.hasMedia && msg.type === 'ptt';
+
         // Admin commands (from group admins only)
         if (msg.body?.startsWith('!linkguard')) {
             const groupChat = chat; // GroupChat
@@ -107,18 +108,18 @@ client.on('message', async (msg) => {
             if (!adminsOnly) return;
 
             // !linkguard reset @mention
-            if (/^!linkguard\s+reset/i.test(msg.body)) {
-                const mentions = await msg.getMentions();
-                if (!mentions.length) {
-                    await chat.sendMessage('Usage: !linkguard reset @user');
-                    return;
-                }
-                for (const m of mentions) {
-                    await resetWarnings(chat.id._serialized, m.id._serialized);
-                    await chat.sendMessage(`✅ Reset warnings for ${m.pushname || m.number}`);
-                }
-                return;
-            }
+            // if (/^!linkguard\s+reset/i.test(msg.body)) {
+            //     const mentions = await msg.getMentions();
+            //     if (!mentions.length) {
+            //         await chat.sendMessage('Usage: !linkguard reset @user');
+            //         return;
+            //     }
+            //     for (const m of mentions) {
+            //         await resetWarnings(chat.id._serialized, m.id._serialized);
+            //         await chat.sendMessage(`✅ Reset warnings for ${m.pushname || m.number}`);
+            //     }
+            //     return;
+            // }
 
             // !linkguard status
             if (/^!linkguard\s+status/i.test(msg.body)) {
@@ -127,21 +128,21 @@ client.on('message', async (msg) => {
             }
 
             // Help
-            if (/^!linkguard(\s+help)?$/i.test(msg.body)) {
-                await chat.sendMessage(
-                    'LinkGuard commands:\n' +
-                    '• !linkguard status — show status\n' +
-                    '• !linkguard reset @user — reset warnings for a user'
-                );
-                return;
-            }
+            // if (/^!linkguard(\s+help)?$/i.test(msg.body)) {
+            //     await chat.sendMessage(
+            //         'LinkGuard commands:\n' +
+            //         '• !linkguard status — show status\n' +
+            //         '• !linkguard reset @user — reset warnings for a user'
+            //     );
+            //     return;
+            // }
         }
 
         // Detect links in normal messages
         const hasLink = LINK_REGEX.test(msg.body || '') ||
             (msg.caption && LINK_REGEX.test(msg.caption)); // also check captions
 
-        if (!hasLink) {
+        if (!hasLink && !isVoiceMessage) {
             return;
         }
 
