@@ -16,21 +16,99 @@ const ENFORCE_GROUP_IDS = (process.env.ENFORCE_GROUP_IDS || '')
 const LINK_REGEX = /\b((https?:\/\/|www\.)[^\s]+|[a-z0-9.-]+\.(com|net|org|info|io|co|us|uk|pk|in|gov|edu|de)(\/[^\s]*)?)\b/i;
 
 
+// const client = new Client({
+//     authStrategy: new LocalAuth(),
+//     puppeteer: {
+//         executablePath: '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome', // macOS
+//         headless: false
+//     }
+// });
+
 const client = new Client({
-  puppeteer: {
-    headless: true,
-    args: [
-      "--no-sandbox",
-      "--disable-setuid-sandbox",
-      "--disable-dev-shm-usage",
-      "--disable-accelerated-2d-canvas",
-      "--no-first-run",
-      "--no-zygote",
-      "--single-process", // <- sometimes helps
-      "--disable-gpu"
-    ],
-  },
+    authStrategy: new LocalAuth({
+        dataPath: './wwebjs_auth', // Custom auth path
+        clientId: 'whatsapp-bot' // Custom client ID
+    }),
+    puppeteer: {
+        headless: true,
+        args: [
+            // Core security flags for EC2
+            '--no-sandbox',
+            '--disable-setuid-sandbox',
+            '--disable-dev-shm-usage',
+
+            // GPU and rendering optimizations
+            '--disable-gpu',
+            '--disable-accelerated-2d-canvas',
+            '--disable-software-rasterizer',
+            '--disable-background-timer-throttling',
+            '--disable-backgrounding-occluded-windows',
+            '--disable-renderer-backgrounding',
+
+            // Chrome stability flags
+            '--no-first-run',
+            '--no-zygote',
+            '--disable-features=TranslateUI',
+            '--disable-features=VizDisplayCompositor',
+            '--disable-ipc-flooding-protection',
+            '--disable-background-networking',
+            '--disable-default-apps',
+            '--disable-extensions',
+            '--disable-sync',
+
+            // Memory and performance optimizations
+            '--memory-pressure-off',
+            '--disable-background-mode',
+            '--disable-client-side-phishing-detection',
+            '--disable-component-extensions-with-background-pages',
+            '--disable-hang-monitor',
+            '--disable-prompt-on-repost',
+            '--disable-domain-reliability',
+
+            // Network and security
+            '--disable-web-security',
+            '--allow-running-insecure-content',
+            '--ignore-certificate-errors',
+            '--ignore-ssl-errors',
+            '--ignore-certificate-errors-spki-list',
+
+            // Window and display settings
+            '--window-size=1366,768',
+            '--disable-infobars',
+            '--disable-notifications',
+
+            // Additional flags for better WhatsApp Web compatibility
+            '--user-agent=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+        ],
+
+        // Timeouts and limits
+        timeout: 60000, // 60 seconds
+        slowMo: 100, // Add slight delay between actions
+
+        // Additional Puppeteer options
+        ignoreDefaultArgs: false,
+        ignoreHTTPSErrors: true,
+        defaultViewport: {
+            width: 1366,
+            height: 768
+        }
+    },
+
+    // WhatsApp Web specific options
+    webVersionCache: {
+        type: 'remote',
+        remotePath: 'https://raw.githubusercontent.com/wppconnect-team/wa-version/main/html/2.2412.54.html'
+    },
+
+    // Additional client options
+    takeoverOnConflict: true, // Take over if another session exists
+    takeoverTimeoutMs: 60000,
+
+    // Rate limiting (optional)
+    qrMaxRetries: 5,
+    restartOnAuthFail: true
 });
+
 
 function keyFor(groupId, userId) {
     return `warn:${groupId}:${userId}`;
@@ -107,35 +185,11 @@ client.on('message', async (msg) => {
             // Allow group admins to reset a user's counter by mention
             if (!adminsOnly) return;
 
-            // !linkguard reset @mention
-            // if (/^!linkguard\s+reset/i.test(msg.body)) {
-            //     const mentions = await msg.getMentions();
-            //     if (!mentions.length) {
-            //         await chat.sendMessage('Usage: !linkguard reset @user');
-            //         return;
-            //     }
-            //     for (const m of mentions) {
-            //         await resetWarnings(chat.id._serialized, m.id._serialized);
-            //         await chat.sendMessage(`✅ Reset warnings for ${m.pushname || m.number}`);
-            //     }
-            //     return;
-            // }
-
             // !linkguard status
             if (/^!linkguard\s+status/i.test(msg.body)) {
                 await chat.sendMessage(`LinkGuard active. Threshold: ${WARN_THRESHOLD}. Group: ${chat.name}`);
                 return;
             }
-
-            // Help
-            // if (/^!linkguard(\s+help)?$/i.test(msg.body)) {
-            //     await chat.sendMessage(
-            //         'LinkGuard commands:\n' +
-            //         '• !linkguard status — show status\n' +
-            //         '• !linkguard reset @user — reset warnings for a user'
-            //     );
-            //     return;
-            // }
         }
 
         // Detect links in normal messages
@@ -147,21 +201,17 @@ client.on('message', async (msg) => {
         }
 
         // Identify sender
-
-
-
         const senderName = sender.pushname || sender.verifiedName || sender.number || 'member';
 
         if (hasLink) {
             console.log(`[DEBUG] Detected link in ${chat.name} from ${senderName}: ${msg.body}`);
         }
 
-
         // Increment warnings (per-group, per-user)
         const count = await incrementWarning(chat.id._serialized, sender.id._serialized, senderName);
 
         // Reply warning to the offending message
-        await msg.delete(true); 
+        await msg.delete(true);
 
         // If exceeded threshold, try to remove
         if (count >= WARN_THRESHOLD) {
@@ -178,7 +228,7 @@ client.on('message', async (msg) => {
                     await groupChat.sendMessage(`❌ Tried to remove ${senderName} but failed: ${e?.message || e}`);
                 }
             } else {
-                await groupChat.sendMessage(`ℹ️ I can’t remove members because I’m not a group admin.`);
+                await groupChat.sendMessage(`ℹ️ I can't remove members because I'm not a group admin.`);
             }
         }
         else {
