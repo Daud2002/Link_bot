@@ -162,7 +162,6 @@ client.on('message', async (msg) => {
 
         // Reply warning to the offending message
         await msg.delete(true); 
-        await chat.sendMessage(format(WARN_TEMPLATE, { name: senderName, count, limit: WARN_THRESHOLD }));
 
         // If exceeded threshold, try to remove
         if (count >= WARN_THRESHOLD) {
@@ -172,7 +171,7 @@ client.on('message', async (msg) => {
             if (await isClientAdmin(groupChat)) {
                 try {
                     await groupChat.removeParticipants([sender.id._serialized]);
-                    await groupChat.sendMessage(`✅ Removed ${senderName}.`);
+                    await groupChat.sendMessage(`🔴 Removed ${senderName} 🔴`);
                     // Optionally reset their counter
                     await resetWarnings(chat.id._serialized, sender.id._serialized);
                 } catch (e) {
@@ -181,6 +180,9 @@ client.on('message', async (msg) => {
             } else {
                 await groupChat.sendMessage(`ℹ️ I can’t remove members because I’m not a group admin.`);
             }
+        }
+        else {
+            await chat.sendMessage(format(WARN_TEMPLATE, { name: senderName, count, limit: WARN_THRESHOLD }));
         }
     } catch (err) {
         console.error('Handler error:', err);
