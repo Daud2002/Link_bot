@@ -13,7 +13,7 @@ const ENFORCE_GROUP_IDS = (process.env.ENFORCE_GROUP_IDS || '')
     .filter(Boolean);
 
 // Very permissive link detection: urls, domains, www, etc.
-const LINK_REGEX = /\b((https?:\/\/|www\.)[^\s]+|[a-z0-9.-]+\.(com|net|org|info|io|co|us|uk|pk|in|gov|edu|de)(\/[^\s]*)?)\b/i;
+const LINK_REGEX = /\b((https?:\/\/|www\.)[^\s]+|[a-z0-9.-]+\.(com|net|org|info|io|co|us|uk|pk|in|gov|edu|de|me|ly)(\/[^\s]*)?)\b/i;
 
 
 const client = new Client({
@@ -96,7 +96,7 @@ client.on('message', async (msg) => {
             return;
         }
 
-        const isVoiceMessage = msg.hasMedia && msg.type === 'ptt';
+        const isVoiceMessage = msg.hasMedia && (msg.type === 'ptt' || msg.type === 'audio');
 
         // Admin commands (from group admins only)
         if (msg.body?.startsWith('!linkguard')) {
