@@ -3,6 +3,7 @@ require('dotenv').config();
 const { Client, LocalAuth } = require('whatsapp-web.js');
 const qrcode = require('qrcode-terminal');
 const storage = require('node-persist');
+const QRCode = require('qrcode');
 
 const WARN_THRESHOLD = parseInt(process.env.WARN_THRESHOLD || '3', 10);
 const WARN_TEMPLATE = process.env.WARN_TEMPLATE || '⚠️ {name}, links are not allowed. Warning {count}/{limit}';
@@ -17,19 +18,19 @@ const LINK_REGEX = /\b((https?:\/\/|www\.)[^\s]+|[a-z0-9.-]+\.(com|net|org|info|
 
 
 const client = new Client({
-  puppeteer: {
-    headless: true,
-    args: [
-      "--no-sandbox",
-      "--disable-setuid-sandbox",
-      "--disable-dev-shm-usage",
-      "--disable-accelerated-2d-canvas",
-      "--no-first-run",
-      "--no-zygote",
-      "--single-process", // <- sometimes helps
-      "--disable-gpu"
-    ],
-  },
+    puppeteer: {
+        headless: true,
+        args: [
+            "--no-sandbox",
+            "--disable-setuid-sandbox",
+            "--disable-dev-shm-usage",
+            "--disable-accelerated-2d-canvas",
+            "--no-first-run",
+            "--no-zygote",
+            "--single-process", // <- sometimes helps
+            "--disable-gpu"
+        ],
+    },
 });
 
 function keyFor(groupId, userId) {
@@ -68,10 +69,23 @@ async function resetWarnings(groupId, userId) {
     await storage.removeItem(keyFor(groupId, userId));
 }
 
-client.on('qr', qr => {
-    qrcode.generate(qr, { small: true });
-    console.log('Scan the QR above with WhatsApp to log in.');
+// client.on('qr', qr => {
+//     qrcode.generate(qr, { small: true });
+//     console.log('Scan the QR above with WhatsApp to log in.');
+// });
+
+
+client.on('qr', async (qr) => {
+    // Convert the QR to a Data URL (image)
+    const qrImageUrl = await QRCode.toDataURL(qr);
+
+    console.log('\n✅ Open this URL in a browser to scan the QR:\n');
+    console.log(qrImageUrl);
+
+    // Optional — pretty message in logs
+    console.log('\n👇 Copy the above URL and open in your browser to see the QR image\n');
 });
+
 
 client.on('ready', async () => {
     console.log('✅ Bot is ready!');
@@ -161,7 +175,7 @@ client.on('message', async (msg) => {
         const count = await incrementWarning(chat.id._serialized, sender.id._serialized, senderName);
 
         // Reply warning to the offending message
-        await msg.delete(true); 
+        await msg.delete(true);
 
         // If exceeded threshold, try to remove
         if (count >= WARN_THRESHOLD) {
