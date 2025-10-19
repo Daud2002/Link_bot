@@ -2,7 +2,7 @@ require('dotenv').config();
 
 const { Client, LocalAuth } = require('whatsapp-web.js');
 const qrcode = require('qrcode-terminal');
-const storage = require('node-persist');
+const { Pool } = require('pg');
 const QRCode = require('qrcode');
 
 const WARN_THRESHOLD = parseInt(process.env.WARN_THRESHOLD || '3', 10);
@@ -27,7 +27,7 @@ const client = new Client({
             "--disable-accelerated-2d-canvas",
             "--no-first-run",
             "--no-zygote",
-            "--single-process", // <- sometimes helps
+            "--single-process",
             "--disable-gpu"
         ],
     },
@@ -52,27 +52,60 @@ async function isClientAdmin(groupChat) {
     return Boolean(mine?.isAdmin || mine?.isSuperAdmin);
 }
 
+// PostgreSQL storage setup
+// Use DATABASE_URL or PG connection env vars
+const pool = new Pool({
+    connectionString: process.env.DATABASE_URL,
+});
+
+// Ensure warnings table exists
+async function ensureTable() {
+    await pool.query(`
+        CREATE TABLE IF NOT EXISTS warnings (
+            key TEXT PRIMARY KEY,
+            group_id TEXT NOT NULL,
+            user_id TEXT NOT NULL,
+            count INTEGER NOT NULL DEFAULT 0,
+            name TEXT,
+            first_at BIGINT
+        )
+    `);
+}
+
+function storageKey(groupId, userId) {
+    return keyFor(groupId, userId);
+}
+
+// Increment warning and return new count
 async function incrementWarning(groupId, userId, name) {
-    const k = keyFor(groupId, userId);
-    const record = (await storage.getItem(k)) || { count: 0, name, firstAt: Date.now() };
-    record.count += 1;
-    record.name = name; // keep latest display name
-    await storage.setItem(k, record);
-    return record.count;
+    const k = storageKey(groupId, userId);
+    const now = Date.now();
+
+    // Try to upsert: if exists increment, else insert with count=1
+    const res = await pool.query(`
+        INSERT INTO warnings(key, group_id, user_id, count, name, first_at)
+        VALUES($1, $2, $3, 1, $4, $5)
+        ON CONFLICT (key) DO UPDATE SET
+            count = warnings.count + 1,
+            name = $4
+        RETURNING count
+    `, [k, groupId, userId, name, now]);
+
+    return res.rows[0]?.count || 1;
 }
 
 async function getWarnings(groupId, userId) {
-    return (await storage.getItem(keyFor(groupId, userId))) || { count: 0, name: '' };
+    const k = storageKey(groupId, userId);
+    const res = await pool.query('SELECT count, name, first_at FROM warnings WHERE key = $1', [k]);
+    if (!res.rows.length) return { count: 0, name: '' };
+    const r = res.rows[0];
+    return { count: r.count || 0, name: r.name || '', firstAt: r.first_at };
 }
 
 async function resetWarnings(groupId, userId) {
-    await storage.removeItem(keyFor(groupId, userId));
+    const k = storageKey(groupId, userId);
+    await pool.query('DELETE FROM warnings WHERE key = $1', [k]);
 }
-
-// client.on('qr', qr => {
-//     qrcode.generate(qr, { small: true });
-//     console.log('Scan the QR above with WhatsApp to log in.');
-// });
 
 
 client.on('qr', async (qr) => {
@@ -89,7 +122,13 @@ client.on('qr', async (qr) => {
 
 client.on('ready', async () => {
     console.log('✅ Bot is ready!');
-    await storage.init({ dir: './data' });
+    try {
+        await ensureTable();
+        console.log('✅ Postgres storage ready');
+    } catch (e) {
+        console.error('❌ Failed to prepare Postgres storage:', e);
+        process.exit(1);
+    }
     const chats = await client.getChats();
     const groups = chats.filter(chat => chat.isGroup);
     console.log('📋 Groups you are in:');
@@ -102,67 +141,31 @@ client.on('message', async (msg) => {
         const sender = await msg.getContact();
         const isAdmin = chat.groupMetadata?.participants.find(p => p.id._serialized === sender.id._serialized)?.isAdmin;
 
-        // Only group chats
         if (!chat.isGroup || isAdmin) return;
 
-        // Enforce only for selected groups if configured
         if (ENFORCE_GROUP_IDS.length && !ENFORCE_GROUP_IDS.includes(chat.id._serialized)) {
             return;
         }
 
         const isVoiceMessage = msg.hasMedia && (msg.type === 'ptt' || msg.type === 'audio');
 
-        // Admin commands (from group admins only)
         if (msg.body?.startsWith('!linkguard')) {
             const groupChat = chat; // GroupChat
             const adminsOnly = await isClientAdmin(groupChat) || groupChat.participants
                 .find(p => p.id?._serialized === msg.author)?.isAdmin;
-
-            // Allow group admins to reset a user's counter by mention
             if (!adminsOnly) return;
-
-            // !linkguard reset @mention
-            // if (/^!linkguard\s+reset/i.test(msg.body)) {
-            //     const mentions = await msg.getMentions();
-            //     if (!mentions.length) {
-            //         await chat.sendMessage('Usage: !linkguard reset @user');
-            //         return;
-            //     }
-            //     for (const m of mentions) {
-            //         await resetWarnings(chat.id._serialized, m.id._serialized);
-            //         await chat.sendMessage(`✅ Reset warnings for ${m.pushname || m.number}`);
-            //     }
-            //     return;
-            // }
-
-            // !linkguard status
             if (/^!linkguard\s+status/i.test(msg.body)) {
                 await chat.sendMessage(`LinkGuard active. Threshold: ${WARN_THRESHOLD}. Group: ${chat.name}`);
                 return;
             }
-
-            // Help
-            // if (/^!linkguard(\s+help)?$/i.test(msg.body)) {
-            //     await chat.sendMessage(
-            //         'LinkGuard commands:\n' +
-            //         '• !linkguard status — show status\n' +
-            //         '• !linkguard reset @user — reset warnings for a user'
-            //     );
-            //     return;
-            // }
         }
 
-        // Detect links in normal messages
         const hasLink = LINK_REGEX.test(msg.body || '') ||
-            (msg.caption && LINK_REGEX.test(msg.caption)); // also check captions
+            (msg.caption && LINK_REGEX.test(msg.caption));
 
         if (!hasLink && !isVoiceMessage) {
             return;
         }
-
-        // Identify sender
-
-
 
         const senderName = sender.pushname || sender.verifiedName || sender.number || 'member';
 
