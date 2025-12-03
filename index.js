@@ -18,6 +18,9 @@ const LINK_REGEX = /\b((https?:\/\/|www\.)[^\s]+|[a-z0-9.-]+\.(com|net|org|info|
 
 
 const client = new Client({
+    authStrategy: new LocalAuth({
+        clientId: 'link-bot-session'
+    }),
     puppeteer: {
         headless: true,
         args: [
