@@ -158,7 +158,7 @@ client.on('message', async (msg) => {
                 .find(p => p.id?._serialized === msg.author)?.isAdmin;
             if (!adminsOnly) return;
             if (/^!linkguard\s+status/i.test(msg.body)) {
-                await chat.sendMessage(`LinkGuard active. Threshold: ${WARN_THRESHOLD}. Group: ${chat.name}`);
+                await chat.sendMessage(`LinkGuard active. Threshold: ${WARN_THRESHOLD}. Group: ${chat.name}`, {sendSeen: false});
                 return;
             }
         }
@@ -186,23 +186,23 @@ client.on('message', async (msg) => {
         // If exceeded threshold, try to remove
         if (count >= WARN_THRESHOLD) {
             const groupChat = chat; // GroupChat
-            await groupChat.sendMessage(format(KICK_TEMPLATE, { name: senderName, count, limit: WARN_THRESHOLD }));
+            await groupChat.sendMessage(format(KICK_TEMPLATE, { name: senderName, count, limit: WARN_THRESHOLD }), {sendSeen: false});
 
             if (await isClientAdmin(groupChat)) {
                 try {
                     await groupChat.removeParticipants([sender.id._serialized]);
-                    await groupChat.sendMessage(`🔴 Removed ${senderName} 🔴`);
+                    await groupChat.sendMessage(`🔴 Removed ${senderName} 🔴`, {sendSeen: false});
                     // Optionally reset their counter
                     await resetWarnings(chat.id._serialized, sender.id._serialized);
                 } catch (e) {
-                    await groupChat.sendMessage(`❌ Tried to remove ${senderName} but failed: ${e?.message || e}`);
+                    await groupChat.sendMessage(`❌ Tried to remove ${senderName} but failed: ${e?.message || e}`, {sendSeen: false});
                 }
             } else {
-                await groupChat.sendMessage(`ℹ️ I can’t remove members because I’m not a group admin.`);
+                await groupChat.sendMessage(`ℹ️ I can’t remove members because I’m not a group admin.`, {sendSeen: false});
             }
         }
         else {
-            await chat.sendMessage(format(WARN_TEMPLATE, { name: senderName, count, limit: WARN_THRESHOLD }));
+            await chat.sendMessage(format(WARN_TEMPLATE, { name: senderName, count, limit: WARN_THRESHOLD }), {sendSeen: false});
         }
     } catch (err) {
         console.error('Handler error:', err);
