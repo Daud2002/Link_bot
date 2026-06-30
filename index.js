@@ -187,21 +187,24 @@ function registerHandlers(c) {
       inFlight++;
       try {
         const chat = await msg.getChat();
-        const sender = await msg.getContact();
-        const isAdmin = chat.groupMetadata?.participants.find(p => p.id._serialized === sender.id._serialized)?.isAdmin;
 
-        if (!chat.isGroup || isAdmin) return;
+        if (!chat.isGroup) return;
 
         if (ENFORCE_GROUP_IDS.length && !ENFORCE_GROUP_IDS.includes(chat.id._serialized)) {
             return;
         }
 
-        const isVoiceMessage = msg.hasMedia && (msg.type === 'ptt' || msg.type === 'audio');
+        // The author's serialized id (works without resolving a full contact).
+        const authorId = msg.author || msg.from;
+
+        // Admin check from group metadata — does NOT depend on getContact().
+        const isAdmin = chat.groupMetadata?.participants
+            .find(p => p.id?._serialized === authorId)?.isAdmin;
 
         if (msg.body?.startsWith('!linkguard')) {
             const groupChat = chat; // GroupChat
             const adminsOnly = await isClientAdmin(groupChat) || groupChat.participants
-                .find(p => p.id?._serialized === msg.author)?.isAdmin;
+                ?.find(p => p.id?._serialized === authorId)?.isAdmin;
             if (!adminsOnly) return;
             if (/^!linkguard\s+status/i.test(msg.body)) {
                 await chat.sendMessage(`LinkGuard active. Threshold: ${WARN_THRESHOLD}. Group: ${chat.name}`, {sendSeen: false});
@@ -209,16 +212,36 @@ function registerHandlers(c) {
             }
         }
 
+        // Admins are exempt from enforcement (but still allowed to run commands above).
+        if (isAdmin) return;
+
+        // --- Relevance detection: only needs `msg`, never the contact. ---
+        const isVoiceMessage = msg.hasMedia && (msg.type === 'ptt' || msg.type === 'audio');
         const hasLink = LINK_REGEX.test(msg.body || '') ||
             (msg.caption && LINK_REGEX.test(msg.caption));
-
-        const isChannelForwarded = !!msg._data.forwardedNewsletterMessageInfo;
+        const isChannelForwarded = !!msg._data?.forwardedNewsletterMessageInfo;
 
         if (!hasLink && !isVoiceMessage && !isChannelForwarded) {
             return;
         }
 
-        const senderName = sender.pushname || sender.verifiedName || sender.number || 'member';
+        // Resolve the contact ONLY now that the message is actionable, and treat
+        // failure as non-fatal — some messages (channels/newsletters/system) have
+        // no resolvable contact and getContact() throws. Fall back to the author id.
+        let sender = null;
+        try {
+            sender = await msg.getContact();
+        } catch (e) {
+            console.warn('getContact() failed, falling back to author id:', e?.message || e);
+        }
+
+        const senderId = sender?.id?._serialized || authorId;
+        if (!senderId) {
+            console.warn('No resolvable sender id; skipping enforcement for this message.');
+            return;
+        }
+        const senderName = sender?.pushname || sender?.verifiedName || sender?.number
+            || (authorId ? authorId.split('@')[0] : 'member');
 
         if (hasLink) {
             console.log(`[DEBUG] Detected link in ${chat.name} from ${senderName}: ${msg.body}`);
@@ -226,7 +249,7 @@ function registerHandlers(c) {
 
 
         // Increment warnings (per-group, per-user)
-        const count = await incrementWarning(chat.id._serialized, sender.id._serialized, senderName);
+        const count = await incrementWarning(chat.id._serialized, senderId, senderName);
 
         // Reply warning to the offending message
         await msg.delete(true);
@@ -238,10 +261,10 @@ function registerHandlers(c) {
 
             if (await isClientAdmin(groupChat)) {
                 try {
-                    await groupChat.removeParticipants([sender.id._serialized]);
+                    await groupChat.removeParticipants([senderId]);
                     await groupChat.sendMessage(`🔴 Removed ${senderName} 🔴`, {sendSeen: false});
                     // Optionally reset their counter
-                    await resetWarnings(chat.id._serialized, sender.id._serialized);
+                    await resetWarnings(chat.id._serialized, senderId);
                 } catch (e) {
                     await groupChat.sendMessage(`❌ Tried to remove ${senderName} but failed: ${e?.message || e}`, {sendSeen: false});
                 }
@@ -363,6 +386,16 @@ async function recycleBrowser() {
 if (RECYCLE_HOURS > 0) {
     setInterval(recycleBrowser, RECYCLE_HOURS * 60 * 60 * 1000).unref();
 }
+
+// Last-resort safety nets: a stray rejection/exception in the WhatsApp page
+// layer should be logged, not silently wedge or kill the bot. Railway's
+// ON_FAILURE restart policy still covers a true fatal crash.
+process.on('unhandledRejection', (reason) => {
+    console.error('Unhandled promise rejection:', reason);
+});
+process.on('uncaughtException', (err) => {
+    console.error('Uncaught exception:', err);
+});
 
 registerHandlers(client);
 startMemoryHarness();
