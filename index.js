@@ -1,5 +1,6 @@
 require('dotenv').config();
 
+const fs = require('fs');
 const { Client, LocalAuth } = require('whatsapp-web.js');
 const qrcode = require('qrcode-terminal');
 const { Pool } = require('pg');
@@ -17,24 +18,63 @@ const ENFORCE_GROUP_IDS = (process.env.ENFORCE_GROUP_IDS || '')
 const LINK_REGEX = /\b((https?:\/\/|www\.)[^\s]+|[a-z0-9.-]+\.(com|net|org|info|io|co|us|uk|pk|in|gov|edu|de|me|ly)(\/[^\s]*)?)\b/i;
 
 
-const client = new Client({
-    authStrategy: new LocalAuth({
-        clientId: 'link-bot-session'
-    }),
-    puppeteer: {
-        headless: true,
-        args: [
-            "--no-sandbox",
-            "--disable-setuid-sandbox",
-            "--disable-dev-shm-usage",
-            "--disable-accelerated-2d-canvas",
-            "--no-first-run",
-            "--no-zygote",
-            "--single-process",
-            "--disable-gpu"
-        ],
-    },
-});
+// Renderer (Chromium) V8 heap cap, MB. Separate from Node's own heap.
+const RENDERER_HEAP_MB = parseInt(process.env.RENDERER_HEAP_MB || '256', 10);
+
+// Low-RAM Chromium launch flags. Tuned for a single, long-lived headless tab
+// running the WhatsApp Web SPA on a 1GB container.
+const PUPPETEER_ARGS = [
+    // sandbox (required in Railway containers)
+    "--no-sandbox",
+    "--disable-setuid-sandbox",
+    // use /tmp instead of the tiny /dev/shm so Chromium doesn't crash under pressure
+    "--disable-dev-shm-usage",
+    // single process + no zygote: biggest RAM saver for one persistent tab
+    "--single-process",
+    "--no-zygote",
+    "--no-first-run",
+    "--disable-gpu",
+    "--disable-accelerated-2d-canvas",
+    // kill background services / threads we never use
+    "--disable-extensions",
+    "--disable-default-apps",
+    "--disable-sync",
+    "--disable-background-networking",
+    "--disable-component-update",
+    "--disable-domain-reliability",
+    "--disable-client-side-phishing-detection",
+    "--disable-breakpad",
+    "--metrics-recording-only",
+    "--mute-audio",
+    "--no-default-browser-check",
+    "--disable-hang-monitor",
+    "--disable-prompt-on-repost",
+    // keep the headless/backgrounded tab responsive so messages aren't missed
+    "--disable-background-timer-throttling",
+    "--disable-backgrounding-occluded-windows",
+    "--disable-renderer-backgrounding",
+    // drop the back/forward cache and other memory-holding features
+    "--disable-features=Translate,BackForwardCache,AcceptCHFrame,MediaRouter,OptimizationHints",
+    // cap the renderer's V8 heap (the JS heap that actually grows over time)
+    `--js-flags=--max-old-space-size=${RENDERER_HEAP_MB}`,
+];
+
+function buildClient() {
+    return new Client({
+        authStrategy: new LocalAuth({
+            clientId: 'link-bot-session'
+        }),
+        puppeteer: {
+            headless: true,
+            // On Railway, point at the system chromium from nixpkgs (lighter than
+            // the bundled full Chrome). Locally this is unset -> bundled Chrome.
+            executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
+            args: PUPPETEER_ARGS,
+        },
+    });
+}
+
+let client = buildClient();
 
 function keyFor(groupId, userId) {
     return `warn:${groupId}:${userId}`;
@@ -111,35 +151,41 @@ async function resetWarnings(groupId, userId) {
 }
 
 
-client.on('qr', async (qr) => {
-    // Convert the QR to a Data URL (image)
-    const qrImageUrl = await QRCode.toDataURL(qr);
+// Number of messages currently being processed. The periodic recycle waits for
+// this to reach 0 so it never tears down the browser mid-deletion.
+let inFlight = 0;
 
-    console.log('\n✅ Open this URL in a browser to scan the QR:\n');
-    console.log(qrImageUrl);
+function registerHandlers(c) {
+    c.on('qr', async (qr) => {
+        // Convert the QR to a Data URL (image)
+        const qrImageUrl = await QRCode.toDataURL(qr);
 
-    // Optional — pretty message in logs
-    console.log('\n👇 Copy the above URL and open in your browser to see the QR image\n');
-});
+        console.log('\n✅ Open this URL in a browser to scan the QR:\n');
+        console.log(qrImageUrl);
+
+        // Optional — pretty message in logs
+        console.log('\n👇 Copy the above URL and open in your browser to see the QR image\n');
+    });
 
 
-client.on('ready', async () => {
-    console.log('✅ Bot is ready!');
-    try {
-        await ensureTable();
-        console.log('✅ Postgres storage ready');
-    } catch (e) {
-        console.error('❌ Failed to prepare Postgres storage:', e);
-        process.exit(1);
-    }
-    const chats = await client.getChats();
-    const groups = chats.filter(chat => chat.isGroup);
-    console.log('📋 Groups you are in:');
-    groups.forEach(g => console.log(`${g.name} => ${g.id._serialized}`));
-});
+    c.on('ready', async () => {
+        console.log('✅ Bot is ready!');
+        try {
+            await ensureTable();
+            console.log('✅ Postgres storage ready');
+        } catch (e) {
+            console.error('❌ Failed to prepare Postgres storage:', e);
+            process.exit(1);
+        }
+        const chats = await client.getChats();
+        const groups = chats.filter(chat => chat.isGroup);
+        console.log('📋 Groups you are in:');
+        groups.forEach(g => console.log(`${g.name} => ${g.id._serialized}`));
+    });
 
-client.on('message', async (msg) => {
-    try {
+    c.on('message', async (msg) => {
+      inFlight++;
+      try {
         const chat = await msg.getChat();
         const sender = await msg.getContact();
         const isAdmin = chat.groupMetadata?.participants.find(p => p.id._serialized === sender.id._serialized)?.isAdmin;
@@ -206,13 +252,118 @@ client.on('message', async (msg) => {
         else {
             await chat.sendMessage(format(WARN_TEMPLATE, { name: senderName, count, limit: WARN_THRESHOLD }), {sendSeen: false});
         }
-    } catch (err) {
+      } catch (err) {
         console.error('Handler error:', err);
+      } finally {
+        inFlight--;
+      }
+    });
+
+    c.on('disconnected', async (reason) => {
+        console.log('Disconnected:', reason);
+        // Don't leave the bot dead on an unexpected disconnect — re-initialize.
+        // LocalAuth means this reconnects without a new QR scan.
+        if (recycling) return; // an intentional recycle handles its own re-init
+        try {
+            await client.initialize();
+        } catch (e) {
+            console.error('Re-initialize after disconnect failed:', e);
+        }
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Memory measurement harness (pure Node, no deps). Logs Node RSS plus the
+// Chromium browser process tree RSS every 30s, tagged by MEM_TAG so the
+// before/after numbers are greppable in Railway logs.
+// ---------------------------------------------------------------------------
+function rssOfPid(pid) {
+    // Linux: /proc/<pid>/statm field 2 (resident pages) * 4KB page size
+    try {
+        const statm = fs.readFileSync(`/proc/${pid}/statm`, 'utf8');
+        const residentPages = parseInt(statm.split(' ')[1], 10);
+        return residentPages * 4096;
+    } catch {
+        return 0;
     }
-});
+}
 
-client.on('disconnected', (reason) => {
-    console.log('Disconnected:', reason);
-});
+function childPidsLinux(pid) {
+    try {
+        const kids = fs.readFileSync(`/proc/${pid}/task/${pid}/children`, 'utf8')
+            .trim().split(/\s+/).filter(Boolean).map(Number);
+        return kids.flatMap(k => [k, ...childPidsLinux(k)]);
+    } catch {
+        return [];
+    }
+}
 
+function mb(bytes) { return (bytes / 1024 / 1024).toFixed(1); }
+
+function startMemoryHarness() {
+    const tag = process.env.MEM_TAG || 'baseline';
+    setInterval(() => {
+        const nodeRss = process.memoryUsage().rss;
+        let browserRss = 0, pids = [];
+        const browser = client.pupBrowser || client.pptr; // fork-dependent handle
+        const bpid = browser?.process?.()?.pid;
+        if (bpid) {
+            pids = [bpid, ...childPidsLinux(bpid)];
+            browserRss = pids.reduce((s, p) => s + rssOfPid(p), 0);
+        }
+        const total = nodeRss + browserRss;
+        console.log(
+            `[MEM:${tag}] node=${mb(nodeRss)}MB chromium=${mb(browserRss)}MB ` +
+            `(pids:${pids.length}) total=${mb(total)}MB`
+        );
+    }, 30000).unref();
+}
+
+// ---------------------------------------------------------------------------
+// Periodic browser recycle. Chromium RSS creeps up over hours; tearing the
+// browser down and bringing it back flushes that creep and keeps RSS flat.
+// LocalAuth preserves the session, so there's no QR re-scan.
+// ---------------------------------------------------------------------------
+const RECYCLE_HOURS = parseFloat(process.env.RECYCLE_HOURS || '5');
+let recycling = false;
+
+async function recycleBrowser() {
+    if (recycling) return;
+    recycling = true;
+    try {
+        // Wait (up to ~30s) for any in-flight message handling to finish.
+        for (let i = 0; inFlight > 0 && i < 60; i++) {
+            await new Promise(r => setTimeout(r, 500));
+        }
+        console.log(`♻️  Recycling browser to release memory (every ${RECYCLE_HOURS}h)…`);
+        try {
+            await client.destroy();
+        } catch (e) {
+            console.error('destroy() during recycle failed (continuing):', e?.message || e);
+        }
+        // Rebuild a fresh client and re-attach handlers, then bring it back up.
+        client = buildClient();
+        registerHandlers(client);
+        await client.initialize();
+        console.log('♻️  Recycle complete.');
+    } catch (e) {
+        console.error('Recycle failed, attempting clean re-init:', e);
+        try {
+            client = buildClient();
+            registerHandlers(client);
+            await client.initialize();
+        } catch (e2) {
+            console.error('Re-init after failed recycle also failed:', e2);
+        }
+    } finally {
+        recycling = false;
+    }
+}
+
+if (RECYCLE_HOURS > 0) {
+    setInterval(recycleBrowser, RECYCLE_HOURS * 60 * 60 * 1000).unref();
+}
+
+registerHandlers(client);
+startMemoryHarness();
 client.initialize();

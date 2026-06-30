@@ -4,7 +4,7 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "start": "node --no-deprecation index.js",
+    "start": "node --no-deprecation --max-old-space-size=256 index.js",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [],
@@ -17,8 +17,9 @@
     "puppeteer": "^24.17.0",
     "qrcode": "^1.5.4",
     "qrcode-terminal": "^0.12.0",
-    "whatsapp-web.js": "github:timothydillan/whatsapp-web.js#fix/ready-event-not-firing"
-
-
+    "whatsapp-web.js": "github:timothydillan/whatsapp-web.js#c99158cc3b08afed39ac8d6ce4af60ad688176b9"
+  },
+  "engines": {
+    "node": ">=20"
   }
 }
