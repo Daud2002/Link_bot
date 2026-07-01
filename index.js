@@ -1,10 +1,11 @@
 require('dotenv').config();
 
 const fs = require('fs');
-const { Client, LocalAuth } = require('whatsapp-web.js');
+const { Client, LocalAuth, MessageMedia } = require('whatsapp-web.js');
 const qrcode = require('qrcode-terminal');
 const { Pool } = require('pg');
 const QRCode = require('qrcode');
+const { generatePosterImage } = require('./gemini');
 
 const WARN_THRESHOLD = parseInt(process.env.WARN_THRESHOLD || '3', 10);
 const WARN_TEMPLATE = process.env.WARN_TEMPLATE || '⚠️ {name}, links are not allowed. Warning {count}/{limit}';
@@ -16,6 +17,16 @@ const ENFORCE_GROUP_IDS = (process.env.ENFORCE_GROUP_IDS || '')
 
 // Very permissive link detection: urls, domains, www, etc.
 const LINK_REGEX = /\b((https?:\/\/|www\.)[^\s]+|[a-z0-9.-]+\.(com|net|org|info|io|co|us|uk|pk|in|gov|edu|de|me|ly)(\/[^\s]*)?)\b/i;
+
+// Poster/image generation command. Anyone in an enforced group can type
+// "!image <description>" to have Gemini generate an image sent back to the group.
+const IMAGE_CMD_PREFIX = process.env.IMAGE_CMD_PREFIX || '!image';
+// Optional: restrict poster generation to specific group ids (comma-separated).
+// If empty, it works in any group the bot is enforcing (ENFORCE_GROUP_IDS).
+const IMAGE_GROUP_IDS = (process.env.IMAGE_GROUP_IDS || '')
+    .split(',')
+    .map(s => s.trim())
+    .filter(Boolean);
 
 
 // Renderer (Chromium) V8 heap cap, MB. Separate from Node's own heap.
@@ -85,6 +96,32 @@ function format(tpl, ctx) {
         .replace('{name}', ctx.name)
         .replace('{count}', String(ctx.count))
         .replace('{limit}', String(ctx.limit));
+}
+
+// Find a participant by id, tolerant of WhatsApp ID-format differences.
+// WhatsApp may deliver an author as "12345@c.us" while group metadata stores
+// the same person as a "@lid" id (or vice-versa). A strict _serialized ===
+// comparison then misses, and an admin looks like a non-admin. So we also
+// compare the numeric/user portion before the "@".
+function userPart(id) {
+    if (!id) return '';
+    // id can be a serialized string ("123@c.us") or an object with .user/._serialized
+    if (typeof id === 'object') {
+        return id.user || (id._serialized ? String(id._serialized).split('@')[0] : '');
+    }
+    return String(id).split('@')[0];
+}
+
+function findParticipant(participants, authorId, authorUser) {
+    if (!participants) return undefined;
+    const wantSerial = authorId;
+    const wantUser = authorUser || userPart(authorId);
+    return participants.find(p => {
+        const ps = p.id?._serialized;
+        if (ps && ps === wantSerial) return true;
+        if (wantUser && userPart(p.id) === wantUser) return true;
+        return false;
+    });
 }
 
 async function isClientAdmin(groupChat) {
@@ -194,17 +231,69 @@ function registerHandlers(c) {
             return;
         }
 
+        // --- Poster/image generation: "!image <description>" ---
+        // Handled before enforcement so it works for everyone (admins included)
+        // and isn't affected by the link/voice rules below.
+        const body = (msg.body || '').trim();
+        if (body.toLowerCase().startsWith(IMAGE_CMD_PREFIX.toLowerCase())) {
+            // Respect an optional per-command group allowlist.
+            if (IMAGE_GROUP_IDS.length && !IMAGE_GROUP_IDS.includes(chat.id._serialized)) {
+                return;
+            }
+
+            const prompt = body.slice(IMAGE_CMD_PREFIX.length).trim();
+            if (!prompt) {
+                await chat.sendMessage(`ℹ️ Usage: ${IMAGE_CMD_PREFIX} <describe the poster you want>`, { sendSeen: false });
+                return;
+            }
+
+            console.log(`[IMAGE] Request in ${chat.name}: "${prompt}"`);
+            await chat.sendMessage('🎨 Generating your poster…', { sendSeen: false });
+
+            try {
+                const { base64, mimeType } = await generatePosterImage(prompt);
+                const media = new MessageMedia(mimeType, base64, 'poster.png');
+                await chat.sendMessage(media, { caption: `🖼️ ${prompt}`, sendSeen: false });
+            } catch (e) {
+                console.error('[IMAGE] Generation failed:', e?.message || e);
+                const reason = e?.message || String(e);
+                if (reason.includes('All Gemini API keys failed') || reason.includes('No Gemini API keys')) {
+                    await chat.sendMessage('❌ Sorry, the image service is unavailable right now (API key not working). Please try again later.', { sendSeen: false });
+                } else {
+                    await chat.sendMessage(`❌ Couldn't generate that image: ${reason.slice(0, 300)}`, { sendSeen: false });
+                }
+            }
+            return; // done — do not fall through to enforcement
+        }
+
         // The author's serialized id (works without resolving a full contact).
         const authorId = msg.author || msg.from;
+        const authorUser = userPart(authorId);
 
         // Admin check from group metadata — does NOT depend on getContact().
-        const isAdmin = chat.groupMetadata?.participants
-            .find(p => p.id?._serialized === authorId)?.isAdmin;
+        // Uses a format-tolerant lookup so @lid vs @c.us id differences don't
+        // make a real admin look like a normal member (which caused admin
+        // messages to be deleted).
+        let authorParticipant = findParticipant(
+            chat.groupMetadata?.participants, authorId, authorUser
+        );
+        // If metadata didn't contain the author (stale/empty), fall back to the
+        // live GroupChat participant list before deciding admin status. Missing
+        // the author here would wrongly enforce against a real admin.
+        if (!authorParticipant && chat.participants) {
+            authorParticipant = findParticipant(chat.participants, authorId, authorUser);
+        }
+        const isAdmin = Boolean(authorParticipant?.isAdmin || authorParticipant?.isSuperAdmin);
+
+        if (!authorParticipant) {
+            console.warn(`[ADMIN] Could not locate author ${authorId} (user=${authorUser}) in ${chat.name}'s participant list — treating as non-admin.`);
+        }
 
         if (msg.body?.startsWith('!linkguard')) {
             const groupChat = chat; // GroupChat
-            const adminsOnly = await isClientAdmin(groupChat) || groupChat.participants
-                ?.find(p => p.id?._serialized === authorId)?.isAdmin;
+            const adminsOnly = await isClientAdmin(groupChat) ||
+                Boolean(findParticipant(groupChat.participants, authorId, authorUser)?.isAdmin
+                    || findParticipant(groupChat.participants, authorId, authorUser)?.isSuperAdmin);
             if (!adminsOnly) return;
             if (/^!linkguard\s+status/i.test(msg.body)) {
                 await chat.sendMessage(`LinkGuard active. Threshold: ${WARN_THRESHOLD}. Group: ${chat.name}`, {sendSeen: false});
