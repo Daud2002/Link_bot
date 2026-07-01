@@ -1,11 +1,10 @@
 require('dotenv').config();
 
 const fs = require('fs');
-const { Client, LocalAuth, MessageMedia } = require('whatsapp-web.js');
+const { Client, LocalAuth } = require('whatsapp-web.js');
 const qrcode = require('qrcode-terminal');
 const { Pool } = require('pg');
 const QRCode = require('qrcode');
-const { generatePosterImage } = require('./imagegen');
 
 const WARN_THRESHOLD = parseInt(process.env.WARN_THRESHOLD || '3', 10);
 const WARN_TEMPLATE = process.env.WARN_TEMPLATE || '⚠️ {name}, links are not allowed. Warning {count}/{limit}';
@@ -17,17 +16,6 @@ const ENFORCE_GROUP_IDS = (process.env.ENFORCE_GROUP_IDS || '')
 
 // Very permissive link detection: urls, domains, www, etc.
 const LINK_REGEX = /\b((https?:\/\/|www\.)[^\s]+|[a-z0-9.-]+\.(com|net|org|info|io|co|us|uk|pk|in|gov|edu|de|me|ly)(\/[^\s]*)?)\b/i;
-
-// Poster/image generation command. Anyone in an enforced group can type
-// "!image <description>" to have Gemini generate an image sent back to the group.
-const IMAGE_CMD_PREFIX = process.env.IMAGE_CMD_PREFIX || '!image';
-// Optional: restrict poster generation to specific group ids (comma-separated).
-// If empty, it works in any group the bot is enforcing (ENFORCE_GROUP_IDS).
-const IMAGE_GROUP_IDS = (process.env.IMAGE_GROUP_IDS || '')
-    .split(',')
-    .map(s => s.trim())
-    .filter(Boolean);
-
 
 // Renderer (Chromium) V8 heap cap, MB. Separate from Node's own heap.
 const RENDERER_HEAP_MB = parseInt(process.env.RENDERER_HEAP_MB || '256', 10);
@@ -112,16 +100,38 @@ function userPart(id) {
     return String(id).split('@')[0];
 }
 
-function findParticipant(participants, authorId, authorUser) {
+// Match a participant against any of the candidate ids we know for the author.
+// `extraIds` lets callers pass alternate serialized ids (e.g. the phone-number
+// "@c.us" id resolved from an "@lid" author) since WhatsApp's LID system means
+// the "@lid" id and the phone id share NO common number — user-part matching
+// alone can't bridge them.
+function findParticipant(participants, authorId, authorUser, extraIds = []) {
     if (!participants) return undefined;
-    const wantSerial = authorId;
-    const wantUser = authorUser || userPart(authorId);
+    const wantSerials = new Set([authorId, ...extraIds].filter(Boolean));
+    const wantUsers = new Set(
+        [authorUser || userPart(authorId), ...extraIds.map(userPart)].filter(Boolean)
+    );
     return participants.find(p => {
         const ps = p.id?._serialized;
-        if (ps && ps === wantSerial) return true;
-        if (wantUser && userPart(p.id) === wantUser) return true;
+        if (ps && wantSerials.has(ps)) return true;
+        if (wantUsers.has(userPart(p.id))) return true;
         return false;
     });
+}
+
+// Resolve the author's alternate serialized ids (both "@lid" and "@c.us" phone
+// forms) using whatsapp-web.js's LID/phone bridge. Returns [] on any failure so
+// admin detection degrades gracefully instead of throwing.
+async function resolveAlternateIds(authorId) {
+    if (!authorId) return [];
+    try {
+        const mapped = await client.getContactLidAndPhone([authorId]);
+        const { lid, pn } = mapped?.[0] || {};
+        return [lid, pn].filter(Boolean).filter(id => id !== authorId);
+    } catch (e) {
+        console.warn(`[ADMIN] getContactLidAndPhone failed for ${authorId}:`, e?.message || e);
+        return [];
+    }
 }
 
 async function isClientAdmin(groupChat) {
@@ -231,71 +241,59 @@ function registerHandlers(c) {
             return;
         }
 
-        // --- Poster/image generation: "!image <description>" ---
-        // Handled before enforcement so it works for everyone (admins included)
-        // and isn't affected by the link/voice rules below.
-        const body = (msg.body || '').trim();
-        if (body.toLowerCase().startsWith(IMAGE_CMD_PREFIX.toLowerCase())) {
-            // Respect an optional per-command group allowlist.
-            if (IMAGE_GROUP_IDS.length && !IMAGE_GROUP_IDS.includes(chat.id._serialized)) {
-                return;
-            }
-
-            const prompt = body.slice(IMAGE_CMD_PREFIX.length).trim();
-            if (!prompt) {
-                await chat.sendMessage(`ℹ️ Usage: ${IMAGE_CMD_PREFIX} <describe the poster you want>`, { sendSeen: false });
-                return;
-            }
-
-            console.log(`[IMAGE] Request in ${chat.name}: "${prompt}"`);
-            await chat.sendMessage('🎨 Generating your poster…', { sendSeen: false });
-
-            try {
-                const { base64, mimeType } = await generatePosterImage(prompt);
-                const media = new MessageMedia(mimeType, base64, 'poster.png');
-                await chat.sendMessage(media, { caption: `🖼️ ${prompt}`, sendSeen: false });
-            } catch (e) {
-                console.error('[IMAGE] Generation failed:', e?.message || e);
-                const reason = e?.message || String(e);
-                if (reason.includes('timed out')) {
-                    await chat.sendMessage('❌ The image took too long to generate. Please try again.', { sendSeen: false });
-                } else if (reason.includes('Image service')) {
-                    await chat.sendMessage('❌ Sorry, the image service is unavailable right now. Please try again in a moment.', { sendSeen: false });
-                } else {
-                    await chat.sendMessage(`❌ Couldn't generate that image: ${reason.slice(0, 300)}`, { sendSeen: false });
-                }
-            }
-            return; // done — do not fall through to enforcement
-        }
-
         // The author's serialized id (works without resolving a full contact).
         const authorId = msg.author || msg.from;
         const authorUser = userPart(authorId);
 
+        // --- Admin-detection diagnostics -----------------------------------
+        // Log everything the admin decision depends on so we can see WHY an
+        // admin is (or isn't) being recognized in the Railway logs.
+        const metaParticipants = chat.groupMetadata?.participants;
+        const liveParticipants = chat.participants;
+        console.log(`[ADMIN] --- message in "${chat.name}" (${chat.id._serialized}) ---`);
+        console.log(`[ADMIN] raw author=${JSON.stringify(msg.author)} from=${JSON.stringify(msg.from)} -> authorId=${authorId} authorUser=${authorUser}`);
+        console.log(`[ADMIN] groupMetadata.participants: ${metaParticipants ? metaParticipants.length + ' entries' : 'MISSING'}; chat.participants: ${liveParticipants ? liveParticipants.length + ' entries' : 'MISSING'}`);
+
+        // WhatsApp may deliver the author as an "@lid" id whose number is
+        // unrelated to the phone-number ("@c.us") id stored in the participant
+        // list. Resolve BOTH forms up front so the lookup can match either one.
+        const altIds = await resolveAlternateIds(authorId);
+        console.log(`[ADMIN] resolved alternate ids for author: ${JSON.stringify(altIds)}`);
+
         // Admin check from group metadata — does NOT depend on getContact().
-        // Uses a format-tolerant lookup so @lid vs @c.us id differences don't
-        // make a real admin look like a normal member (which caused admin
-        // messages to be deleted).
+        // Uses a format-tolerant lookup (incl. the LID<->phone alternates above)
+        // so @lid vs @c.us id differences don't make a real admin look like a
+        // normal member (which caused admin messages to be deleted).
         let authorParticipant = findParticipant(
-            chat.groupMetadata?.participants, authorId, authorUser
+            metaParticipants, authorId, authorUser, altIds
         );
+        let matchedFrom = authorParticipant ? 'groupMetadata' : null;
         // If metadata didn't contain the author (stale/empty), fall back to the
         // live GroupChat participant list before deciding admin status. Missing
         // the author here would wrongly enforce against a real admin.
-        if (!authorParticipant && chat.participants) {
-            authorParticipant = findParticipant(chat.participants, authorId, authorUser);
+        if (!authorParticipant && liveParticipants) {
+            authorParticipant = findParticipant(liveParticipants, authorId, authorUser, altIds);
+            if (authorParticipant) matchedFrom = 'chat.participants';
         }
         const isAdmin = Boolean(authorParticipant?.isAdmin || authorParticipant?.isSuperAdmin);
 
-        if (!authorParticipant) {
-            console.warn(`[ADMIN] Could not locate author ${authorId} (user=${authorUser}) in ${chat.name}'s participant list — treating as non-admin.`);
+        if (authorParticipant) {
+            console.log(`[ADMIN] matched participant via ${matchedFrom}: id=${JSON.stringify(authorParticipant.id?._serialized)} isAdmin=${authorParticipant.isAdmin} isSuperAdmin=${authorParticipant.isSuperAdmin} -> isAdmin=${isAdmin}`);
+        } else {
+            // Dump the known admin ids so we can compare formats against authorId.
+            const source = metaParticipants || liveParticipants || [];
+            const adminIds = source
+                .filter(p => p.isAdmin || p.isSuperAdmin)
+                .map(p => p.id?._serialized);
+            console.warn(`[ADMIN] Could not locate author ${authorId} (user=${authorUser}) in "${chat.name}"'s participant list — treating as NON-admin.`);
+            console.warn(`[ADMIN] known admin ids in group: ${JSON.stringify(adminIds)}`);
         }
 
         if (msg.body?.startsWith('!linkguard')) {
             const groupChat = chat; // GroupChat
             const adminsOnly = await isClientAdmin(groupChat) ||
-                Boolean(findParticipant(groupChat.participants, authorId, authorUser)?.isAdmin
-                    || findParticipant(groupChat.participants, authorId, authorUser)?.isSuperAdmin);
+                Boolean(findParticipant(groupChat.participants, authorId, authorUser, altIds)?.isAdmin
+                    || findParticipant(groupChat.participants, authorId, authorUser, altIds)?.isSuperAdmin);
             if (!adminsOnly) return;
             if (/^!linkguard\s+status/i.test(msg.body)) {
                 await chat.sendMessage(`LinkGuard active. Threshold: ${WARN_THRESHOLD}. Group: ${chat.name}`, {sendSeen: false});
@@ -304,7 +302,11 @@ function registerHandlers(c) {
         }
 
         // Admins are exempt from enforcement (but still allowed to run commands above).
-        if (isAdmin) return;
+        if (isAdmin) {
+            console.log(`[ADMIN] author is admin — exempt from enforcement, message left in place.`);
+            return;
+        }
+        console.log(`[ADMIN] author is NOT admin — subject to link/voice enforcement.`);
 
         // --- Relevance detection: only needs `msg`, never the contact. ---
         const isVoiceMessage = msg.hasMedia && (msg.type === 'ptt' || msg.type === 'audio');
