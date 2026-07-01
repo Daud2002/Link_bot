@@ -5,7 +5,7 @@ const { Client, LocalAuth, MessageMedia } = require('whatsapp-web.js');
 const qrcode = require('qrcode-terminal');
 const { Pool } = require('pg');
 const QRCode = require('qrcode');
-const { generatePosterImage } = require('./gemini');
+const { generatePosterImage } = require('./imagegen');
 
 const WARN_THRESHOLD = parseInt(process.env.WARN_THRESHOLD || '3', 10);
 const WARN_TEMPLATE = process.env.WARN_TEMPLATE || '⚠️ {name}, links are not allowed. Warning {count}/{limit}';
@@ -257,8 +257,10 @@ function registerHandlers(c) {
             } catch (e) {
                 console.error('[IMAGE] Generation failed:', e?.message || e);
                 const reason = e?.message || String(e);
-                if (reason.includes('All Gemini API keys failed') || reason.includes('No Gemini API keys')) {
-                    await chat.sendMessage('❌ Sorry, the image service is unavailable right now (API key not working). Please try again later.', { sendSeen: false });
+                if (reason.includes('timed out')) {
+                    await chat.sendMessage('❌ The image took too long to generate. Please try again.', { sendSeen: false });
+                } else if (reason.includes('Image service')) {
+                    await chat.sendMessage('❌ Sorry, the image service is unavailable right now. Please try again in a moment.', { sendSeen: false });
                 } else {
                     await chat.sendMessage(`❌ Couldn't generate that image: ${reason.slice(0, 300)}`, { sendSeen: false });
                 }
