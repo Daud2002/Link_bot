@@ -223,10 +223,21 @@ function registerHandlers(c) {
             console.error('❌ Failed to prepare Postgres storage:', e);
             process.exit(1);
         }
-        const chats = await client.getChats();
-        const groups = chats.filter(chat => chat.isGroup);
-        console.log('📋 Groups you are in:');
-        groups.forEach(g => console.log(`${g.name} => ${g.id._serialized}`));
+        // List groups straight from WhatsApp's in-memory chat store. getChats()
+        // builds a full model per chat (group metadata refresh + last-message DB
+        // read), which spiked Chromium's memory on the 1GB Railway box and
+        // crashed the browser ("Target closed") right after startup.
+        try {
+            const groups = await c.pupPage.evaluate(() =>
+                window.require('WAWebCollections').Chat.getModelsArray()
+                    .filter(ch => ch.groupMetadata)
+                    .map(ch => ({ name: ch.formattedTitle || ch.name, id: ch.id._serialized }))
+            );
+            console.log('📋 Groups you are in:');
+            groups.forEach(g => console.log(`${g.name} => ${g.id}`));
+        } catch (e) {
+            console.warn('Could not list groups (non-fatal):', e?.message || e);
+        }
     });
 
     c.on('message', async (msg) => {
