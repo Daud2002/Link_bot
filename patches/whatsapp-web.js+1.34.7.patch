@@ -1,0 +1,55 @@
+diff --git a/node_modules/whatsapp-web.js/src/util/Injected/Utils.js b/node_modules/whatsapp-web.js/src/util/Injected/Utils.js
+index 540078a..caca2ab 100644
+--- a/node_modules/whatsapp-web.js/src/util/Injected/Utils.js
++++ b/node_modules/whatsapp-web.js/src/util/Injected/Utils.js
+@@ -582,7 +582,7 @@ exports.LoadUtils = () => {
+ 
+         return window
+             .require('WAWebCollections')
+-            .Msg.get(newMsgKey._serialized);
++            .Msg.get(newMsgKey._serialized ?? newMsgKey.toString());
+     };
+ 
+     window.WWebJS.editMessage = async (msg, content, options = {}) => {
+@@ -834,6 +834,13 @@ exports.LoadUtils = () => {
+             });
+         }
+ 
++        // WhatsApp Web >= 2.3000.1048572507 no longer sets `_serialized` on
++        // MsgKey objects, so Message.id._serialized would be undefined and
++        // delete()/reply()/react() etc. would fail. toString() still works.
++        if (msg.id && msg.id._serialized === undefined) {
++            msg.id._serialized = message.id.toString();
++        }
++
+         delete msg.pendingAckUpdate;
+ 
+         return msg;
+@@ -981,16 +988,20 @@ exports.LoadUtils = () => {
+ 
+         model.lastMessage = null;
+         if (model.msgs && model.msgs.length) {
+-            const lastMessage = chat.lastReceivedKey
+-                ? window
+-                      .require('WAWebCollections')
+-                      .Msg.get(chat.lastReceivedKey._serialized) ||
++            // WhatsApp Web >= 2.3000.1048572507 no longer sets `_serialized` on
++            // MsgKey objects; passing undefined to getMessagesById makes
++            // IndexedDB throw and breaks getChats()/getChatById(). toString()
++            // still returns the serialized key.
++            const lastKey = chat.lastReceivedKey
++                ? chat.lastReceivedKey._serialized ??
++                  chat.lastReceivedKey.toString()
++                : null;
++            const lastMessage = lastKey
++                ? window.require('WAWebCollections').Msg.get(lastKey) ||
+                   (
+                       await window
+                           .require('WAWebCollections')
+-                          .Msg.getMessagesById([
+-                              chat.lastReceivedKey._serialized,
+-                          ])
++                          .Msg.getMessagesById([lastKey])
+                   )?.messages?.[0]
+                 : null;
+             lastMessage &&

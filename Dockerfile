@@ -22,7 +22,10 @@ ENV PUPPETEER_SKIP_DOWNLOAD=1 \
     MEM_TAG=optimized
 
 # Install dependencies (no Chrome download thanks to the env var above).
+# patches/ must be present before `npm install` so the postinstall hook
+# (patch-package) can apply our whatsapp-web.js fix.
 COPY package*.json ./
+COPY patches ./patches
 RUN npm install
 
 # Copy the rest of the app.

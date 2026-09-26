@@ -7,8 +7,7 @@ const { Pool } = require('pg');
 const QRCode = require('qrcode');
 
 const WARN_THRESHOLD = parseInt(process.env.WARN_THRESHOLD || '3', 10);
-const WARN_TEMPLATE = process.env.WARN_TEMPLATE || '⚠️ {name}, links are not allowed. Warning {count}/{limit}';
-const KICK_TEMPLATE = process.env.KICK_TEMPLATE || '🚨 {name} exceeded {limit} warnings. Removing from group…';
+const WARN_TEMPLATE = process.env.WARN_TEMPLATE || '⚠️ {name}, Links & Voice messages are not allowed.';
 const ENFORCE_GROUP_IDS = (process.env.ENFORCE_GROUP_IDS || '')
     .split(',')
     .map(s => s.trim())
@@ -336,6 +335,13 @@ function registerHandlers(c) {
         const senderName = sender?.pushname || sender?.verifiedName || sender?.number
             || (authorId ? authorId.split('@')[0] : 'member');
 
+        // Tag the sender in our replies. WhatsApp only renders a mention when the
+        // text contains "@<user>" AND the id is passed in `mentions`. Use the id
+        // exactly as delivered in this group (often an "@lid" id) so it resolves.
+        const mentionId = authorId || senderId;
+        const mentionTag = `@${userPart(mentionId)}`;
+        const mentionOpts = { sendSeen: false, mentions: [mentionId] };
+
         if (hasLink) {
             console.log(`[DEBUG] Detected link in ${chat.name} from ${senderName}: ${msg.body}`);
         }
@@ -350,12 +356,11 @@ function registerHandlers(c) {
         // If exceeded threshold, try to remove
         if (count >= WARN_THRESHOLD) {
             const groupChat = chat; // GroupChat
-            await groupChat.sendMessage(format(KICK_TEMPLATE, { name: senderName, count, limit: WARN_THRESHOLD }), {sendSeen: false});
 
             if (await isClientAdmin(groupChat)) {
                 try {
                     await groupChat.removeParticipants([senderId]);
-                    await groupChat.sendMessage(`🔴 Removed ${senderName} 🔴`, {sendSeen: false});
+                    await groupChat.sendMessage(`🔴 Removed ${mentionTag} 🔴`, mentionOpts);
                     // Optionally reset their counter
                     await resetWarnings(chat.id._serialized, senderId);
                 } catch (e) {
@@ -366,7 +371,7 @@ function registerHandlers(c) {
             }
         }
         else {
-            await chat.sendMessage(format(WARN_TEMPLATE, { name: senderName, count, limit: WARN_THRESHOLD }), {sendSeen: false});
+            await chat.sendMessage(format(WARN_TEMPLATE, { name: mentionTag, count, limit: WARN_THRESHOLD }), mentionOpts);
         }
       } catch (err) {
         console.error('Handler error:', err);
